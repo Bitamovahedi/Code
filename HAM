@@ -1,0 +1,671 @@
+# ============================================================
+# HAM10000 Pipeline (7 classes)
+# ============================================================
+
+# ---------------------- ENV & IMPORTS -----------------------
+import os
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'  # reduce fragmentation
+
+import random, json, cv2, glob
+import numpy as np
+import pandas as pd
+from glob import glob as gglob
+from contextlib import contextmanager
+
+import torch, torch.nn as nn, torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from torch.amp import autocast
+from torch.cuda.amp import GradScaler
+
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import label_binarize
+from sklearn.metrics import (classification_report, confusion_matrix,
+                             accuracy_score, recall_score, f1_score,
+                             roc_curve, roc_auc_score, precision_recall_curve,
+                             average_precision_score)
+
+import timm
+from timm.data import Mixup
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+from tqdm import tqdm
+
+# ---------------------- GLOBAL CONFIG -----------------------
+SEED = 42
+random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
+if torch.cuda.is_available(): torch.cuda.manual_seed_all(SEED)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+torch.backends.cudnn.benchmark = True
+try:
+    torch.set_float32_matmul_precision('medium')
+except Exception:
+    pass
+
+# Paths (CHANGE if needed)
+DATA_DIR = "/kaggle/input/ham10000"
+
+# Backbones
+ACC_BACKBONE = "tf_efficientnet_b6_ns"   # accuracy-focused
+BAL_BACKBONE = "resnext50_32x4d"         # balanced-accuracy–focused
+
+# Per-model sizes & batches (safe for ~24GB VRAM)
+IMG_SIZE_ACC = 496
+IMG_SIZE_BAL = 384
+BATCH_SIZE_ACC = 12
+BATCH_SIZE_BAL = 32
+NUM_WORKERS = 2
+
+# Schedules (epochs per stage)
+EPOCHS_ACC = (10, 40, 30)
+EPOCHS_BAL = (10, 40, 20)
+
+# Optim / reg
+WEIGHT_DECAY = 2.5e-6
+DROPOUT = 0.42
+LABEL_SMOOTHING = 0.02
+# Mixup per stage (S1, S2, S3)
+MIXUP_ACC = (0.00, 0.06, 0.00)   # ACC: no mix in Stage3 to maximize top-1
+MIXUP_BAL = (0.00, 0.20, 0.10)   # BAL: stronger mixup keeps balance
+# ComboLoss hyperparams
+LOSS_CFG_ACC = dict(alpha=0.5, gamma=1.5)
+LOSS_CFG_BAL = dict(alpha=0.6, gamma=2.0)
+# LRs (head/backbone per stage)
+LRS_ACC = dict(head1=3e-4, back2=5e-5, head2=2e-4, back3=2e-5, head3=7e-5)
+LRS_BAL = dict(head1=3e-4, back2=8e-5, head2=3e-4, back3=4e-5, head3=1.2e-4)
+
+# EMA / AMP / TTA
+USE_EMA = True
+EMA_DECAY = 0.999
+scaler = GradScaler(enabled=torch.cuda.is_available())
+TTA_MODES = ("orig","hflip","rot90","rot180","rot270")
+
+# Checkpoints
+CKPT_ACC = "best_acc_model.pth"
+CKPT_BAL = "best_balanced_model.pth"
+
+# ---------------- SAFE FACTORY & CKPT LOAD ------------------
+def create_backbone_safe(name: str, pretrained: bool = True):
+    """Create timm model with alias support; fallback if no pretrained weights."""
+    alias = {
+        "efficientnetv2_s": "tf_efficientnetv2_s",
+        "efficientnetv2_m": "tf_efficientnetv2_m",
+        "efficientnetv2_l": "tf_efficientnetv2_l",
+        "efficientnet_b5": "tf_efficientnet_b5_ns",
+        "efficientnet_b6": "tf_efficientnet_b6_ns",
+        "efficientnet_b7": "tf_efficientnet_b7_ns",
+    }
+    name = alias.get(name, name)
+    try:
+        return timm.create_model(name, pretrained=pretrained, num_classes=0)
+    except RuntimeError as e:
+        if "No pretrained weights exist" in str(e) or "pretrained" in str(e):
+            print(f"[warn] {e} -> fallback to pretrained=False for '{name}'")
+            return timm.create_model(name, pretrained=False, num_classes=0)
+        raise
+
+def load_ckpt_safe(path, device):
+    """Allow full checkpoint load (PyTorch 2.6 changed default)."""
+    return torch.load(path, map_location=device, weights_only=False)
+
+# ---------------------- DATA LOADING (HAM) ------------------
+# HAM10000 classes (7)
+disease_dict = {'akiec':0,'bcc':1,'bkl':2,'df':3,'mel':4,'nv':5,'vasc':6}
+class_labels_abbr = list(disease_dict.keys())
+num_classes = len(disease_dict)
+
+# Find metadata CSV robustly
+def find_ham_metadata_csv(data_dir):
+    # Typical name: "HAM10000_metadata.csv"
+    cands = gglob(os.path.join(data_dir, "**", "*metadata*.csv"), recursive=True)
+    if len(cands)==0:
+        raise FileNotFoundError("HAM metadata CSV not found. Expected *metadata*.csv under DATA_DIR.")
+    # prefer file containing 'HAM10000_metadata'
+    for c in cands:
+        if "ham" in os.path.basename(c).lower() and "metadata" in os.path.basename(c).lower():
+            return c
+    return cands[0]
+
+meta_csv = find_ham_metadata_csv(DATA_DIR)
+meta = pd.read_csv(meta_csv)
+
+# image paths (search recursively)
+all_imgs = gglob(os.path.join(DATA_DIR, "**", "*.jpg"), recursive=True) + \
+           gglob(os.path.join(DATA_DIR, "**", "*.png"), recursive=True)
+id2path = {os.path.splitext(os.path.basename(p))[0].replace('_downsampled',''): p for p in all_imgs}
+if len(id2path) == 0:
+    raise FileNotFoundError("No image files found under DATA_DIR (searched for *.jpg/*.png).")
+
+# Build dataframe with path & labels
+df = meta.copy()
+if 'image_id' not in df.columns or 'dx' not in df.columns:
+    raise ValueError("Metadata must contain columns: image_id, dx")
+df['path'] = df['image_id'].map(id2path.get)
+df = df.dropna(subset=['path'])
+
+# keep only classes in disease_dict
+df = df[df['dx'].isin(disease_dict.keys())].reset_index(drop=True)
+df['cell_type_idx'] = df['dx'].map(disease_dict).astype(int)
+
+# Fill metadata features
+if 'age' not in df.columns:  # some dumps use 'age_approx'
+    if 'age_approx' in df.columns:
+        df['age'] = df['age_approx']
+    else:
+        df['age'] = np.nan
+df['age'] = df['age'].fillna(df['age'].mean()).clip(0, 100)
+if 'sex' not in df.columns:
+    df['sex'] = 'unknown'
+df['sex'] = df['sex'].fillna('unknown')
+
+# Train/Val/Test split (stratified)
+train_df, temp_df = train_test_split(df, test_size=0.2, stratify=df['cell_type_idx'], random_state=SEED)
+val_df,   test_df = train_test_split(temp_df, test_size=0.5, stratify=temp_df['cell_type_idx'], random_state=SEED)
+
+# One-hot for sex + interaction term
+train_df = pd.get_dummies(train_df, columns=['sex'], prefix='sex', dtype=float)
+val_df   = pd.get_dummies(val_df,   columns=['sex'], prefix='sex', dtype=float)
+test_df  = pd.get_dummies(test_df,  columns=['sex'], prefix='sex', dtype=float)
+all_cols = set(train_df.columns)|set(val_df.columns)|set(test_df.columns)
+sex_cols = [c for c in all_cols if c.startswith('sex_')]
+for d in [train_df,val_df,test_df]:
+    for c in sex_cols:
+        if c not in d.columns: d[c] = 0.0
+    d['age_sex_interaction'] = d.get('age',0) * d.get('sex_male',0)
+metadata_features = ['age'] + sorted(sex_cols) + ['age_sex_interaction']
+
+# ---------------------- DATASET & TFMS ----------------------
+def build_transforms(size):
+    train_t = A.Compose([
+        A.RandomResizedCrop(size=(size,size), scale=(0.7,1.0)),
+        A.HorizontalFlip(p=0.5), A.VerticalFlip(p=0.5), A.Rotate(limit=30,p=0.5),
+        A.ColorJitter(p=0.2),
+        A.CoarseDropout(max_holes=1, max_height=int(0.12*size), max_width=int(0.12*size), p=0.2),
+        A.Normalize(mean=(0.485,0.456,0.406), std=(0.229,0.224,0.225)),
+        ToTensorV2()
+    ])
+    val_t = A.Compose([
+        A.Resize(height=size, width=size),
+        A.Normalize(mean=(0.485,0.456,0.406), std=(0.229,0.224,0.225)),
+        ToTensorV2()
+    ])
+    return train_t, val_t
+
+train_tf_acc, val_tf_acc = build_transforms(IMG_SIZE_ACC)
+train_tf_bal, val_tf_bal = build_transforms(IMG_SIZE_BAL)
+
+class SkinDataset(Dataset):
+    """Return ((image_tensor, meta_tensor), label_idx)."""
+    def __init__(self, df, metadata_cols, transform=None):
+        self.df = df.reset_index(drop=True)
+        self.meta_cols = metadata_cols
+        self.t = transform
+    def __len__(self): return len(self.df)
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        img = cv2.cvtColor(cv2.imread(row['path']), cv2.COLOR_BGR2RGB)
+        img = self.t(image=img)['image'] if self.t else img
+        meta = torch.tensor(row[self.meta_cols].values.astype(np.float32))
+        label = torch.tensor(row['cell_type_idx'], dtype=torch.long)
+        return (img, meta), label
+
+# Per-model loaders
+train_loader_acc = DataLoader(SkinDataset(train_df, metadata_features, train_tf_acc),
+                              batch_size=BATCH_SIZE_ACC, shuffle=True, num_workers=NUM_WORKERS,
+                              pin_memory=True, drop_last=True)
+val_loader_acc   = DataLoader(SkinDataset(val_df,   metadata_features, val_tf_acc),
+                              batch_size=BATCH_SIZE_ACC, shuffle=False, num_workers=NUM_WORKERS,
+                              pin_memory=True)
+test_loader_acc  = DataLoader(SkinDataset(test_df,  metadata_features, val_tf_acc),
+                              batch_size=BATCH_SIZE_ACC, shuffle=False, num_workers=NUM_WORKERS,
+                              pin_memory=True)
+
+train_loader_bal = DataLoader(SkinDataset(train_df, metadata_features, train_tf_bal),
+                              batch_size=BATCH_SIZE_BAL, shuffle=True, num_workers=NUM_WORKERS,
+                              pin_memory=True, drop_last=True)
+val_loader_bal   = DataLoader(SkinDataset(val_df,   metadata_features, val_tf_bal),
+                              batch_size=BATCH_SIZE_BAL, shuffle=False, num_workers=NUM_WORKERS,
+                              pin_memory=True)
+test_loader_bal  = DataLoader(SkinDataset(test_df,  metadata_features, val_tf_bal),
+                              batch_size=BATCH_SIZE_BAL, shuffle=False, num_workers=NUM_WORKERS,
+                              pin_memory=True)
+
+# ---------------- META + BACKBONE WRAPPER -------------------
+class MetaAttention(nn.Module):
+    """Lightweight self-attention over metadata -> 32-dim embedding."""
+    def __init__(self, input_dim, embed_dim=128):
+        super().__init__()
+        self.key = nn.Linear(input_dim, embed_dim)
+        self.query = nn.Linear(input_dim, embed_dim)
+        self.value = nn.Linear(input_dim, embed_dim)
+        self.norm = nn.LayerNorm(embed_dim)
+        self.fc = nn.Linear(embed_dim, 32)
+    def forward(self, x):
+        k = self.key(x).unsqueeze(1)
+        q = self.query(x).unsqueeze(1)
+        v = self.value(x).unsqueeze(1)
+        attn = torch.softmax(torch.matmul(q, k.transpose(-2,-1)) / (k.size(-1)**0.5), dim=-1)
+        out = torch.matmul(attn, v).squeeze(1)
+        return self.fc(self.norm(out))
+
+class BackboneMeta(nn.Module):
+    """Image backbone + MetaAttention fusion + classifier head."""
+    def __init__(self, backbone_name, num_classes, meta_dim, dropout=DROPOUT, pretrained=True):
+        super().__init__()
+        self.backbone = create_backbone_safe(backbone_name, pretrained=pretrained)
+        feat_dim = self.backbone.num_features
+        self.meta = MetaAttention(meta_dim, embed_dim=128)  # -> 32
+        self.classifier = nn.Sequential(
+            nn.LayerNorm(feat_dim + 32),
+            nn.Linear(feat_dim + 32, 512),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(512, num_classes)
+        )
+    def forward(self, x_img, x_meta):
+        f_img = self.backbone(x_img)
+        f_meta = self.meta(x_meta)
+        x = torch.cat([f_img, f_meta], dim=1)
+        return self.classifier(x)
+
+# ------------------ WEIGHTS & LOSSES ------------------------
+def effective_number_weights(labels_series, num_classes, beta=0.9995):
+    """Effective number of samples (class weights)."""
+    counts = labels_series.value_counts().sort_index().values.astype(np.float64)
+    en = (1.0 - np.power(beta, counts)) / (1.0 - beta)
+    w = 1.0 / (en + 1e-8)
+    w = w / (w.sum() + 1e-8)
+    return torch.tensor(w, dtype=torch.float32, device=device)
+
+# On HAM, class imbalance is milder than ISIC, but still present
+USE_CLASS_WEIGHTS_ACC = False
+USE_CLASS_WEIGHTS_BAL = True
+WEIGHTS_ACC = effective_number_weights(train_df['cell_type_idx'], num_classes, beta=0.999) if USE_CLASS_WEIGHTS_ACC else None
+WEIGHTS_BAL = effective_number_weights(train_df['cell_type_idx'], num_classes, beta=0.9995) if USE_CLASS_WEIGHTS_BAL else None
+
+class ComboLoss(nn.Module):
+    """ComboLoss = alpha * Focal(CE) + (1 - alpha) * CE; supports hard & soft labels."""
+    def __init__(self, alpha=0.6, gamma=2.0, weight=None, reduction='mean'):
+        super().__init__()
+        self.alpha = alpha; self.gamma = gamma; self.weight = weight; self.reduction = reduction
+    def forward(self, logits, targets):
+        logp = F.log_softmax(logits, dim=1)
+        # CE term (hard vs soft labels)
+        if targets.dtype in (torch.float16, torch.float32, torch.float64) and targets.dim()==2:
+            per_class = -targets * logp
+            if self.weight is not None:
+                per_class = per_class * self.weight.view(1,-1)
+            ce = per_class.sum(dim=1)
+        else:
+            ce = F.nll_loss(logp, targets, weight=self.weight, reduction='none')
+        # Focal on CE
+        pt = torch.exp(-ce)
+        focal = ((1 - pt)**self.gamma) * ce
+        loss = self.alpha * focal + (1 - self.alpha) * ce
+        if self.reduction == 'mean': return loss.mean()
+        if self.reduction == 'sum':  return loss.sum()
+        return loss
+
+def build_mixup(alpha):
+    return Mixup(mixup_alpha=alpha, cutmix_alpha=0.0,
+                 label_smoothing=LABEL_SMOOTHING, num_classes=num_classes)
+
+# --------------- TRAIN / VALIDATE UTILS ---------------------
+def ema_update(ema_state, model, decay):
+    with torch.no_grad():
+        if ema_state is None:
+            return {k: v.detach().clone() for k,v in model.state_dict().items()}
+        for k, v in model.state_dict().items():
+            if v.dtype.is_floating_point:
+                ema_state[k].mul_(decay).add_(v.detach(), alpha=(1.0 - decay))
+            else:
+                ema_state[k] = v
+        return ema_state
+
+@contextmanager
+def use_ema_weights(model, ema_state):
+    if (ema_state is None) or (not USE_EMA):
+        yield; return
+    backup = {k: v.detach().clone() for k,v in model.state_dict().items()}
+    model.load_state_dict(ema_state, strict=False)
+    try:
+        yield
+    finally:
+        model.load_state_dict(backup, strict=False)
+
+def train_one_epoch(model, loader, opt, mixup, criterion, ema_state):
+    model.train()
+    total = 0.0
+    for (imgs, metas), labels in tqdm(loader, desc="Training"):
+        imgs, metas, labels = imgs.to(device), metas.to(device), labels.to(device)
+        # mixup-safe
+        if mixup.mixup_alpha > 0 and (imgs.size(0) % 2 == 1):
+            imgs, metas, labels = imgs[:-1], metas[:-1], labels[:-1]
+        lbl = mixup(imgs, labels)[1] if mixup.mixup_alpha > 0 else labels
+
+        opt.zero_grad(set_to_none=True)
+        with autocast(device_type='cuda', enabled=torch.cuda.is_available()):
+            logits = model(imgs, metas)
+            loss = criterion(logits, lbl)
+        scaler.scale(loss).backward()
+        scaler.step(opt); scaler.update()
+        if USE_EMA: ema_state = ema_update(ema_state, model, EMA_DECAY)
+        total += loss.item() * imgs.size(0)
+    return total / len(loader.dataset), ema_state
+
+@torch.no_grad()
+def validate_one_epoch(model, loader, criterion, ema_state):
+    model.eval()
+    total, preds, gts = 0.0, [], []
+    with use_ema_weights(model, ema_state):
+        for (imgs, metas), labels in tqdm(loader, desc="Validating"):
+            imgs, metas, labels = imgs.to(device), metas.to(device), labels.to(device)
+            logits = model(imgs, metas)
+            loss = criterion(logits, labels)
+            total += loss.item() * imgs.size(0)
+            preds.extend(torch.argmax(logits, dim=1).cpu().numpy())
+            gts.extend(labels.cpu().numpy())
+    acc = accuracy_score(gts, preds)
+    bacc = recall_score(gts, preds, average='macro')
+    f1   = f1_score(gts, preds, average='macro')
+    return total / len(loader.dataset), acc, bacc, f1
+
+def run_stages(model, loaders, epochs_3tuple, lrs, loss_cfg, weights, ckpt_path,
+               mixup_alphas, save_metric="bacc"):
+    """3-stage training schedule; save best by the chosen metric."""
+    best_val, ema_state = -1.0, None
+    criterion = ComboLoss(weight=weights, **loss_cfg).to(device)
+
+    # Stage1: train head+meta (freeze backbone)
+    for p in model.backbone.parameters(): p.requires_grad = False
+    for p in list(model.meta.parameters()) + list(model.classifier.parameters()): p.requires_grad = True
+    opt1 = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()),
+                             lr=lrs["head1"], weight_decay=WEIGHT_DECAY)
+    sch1 = torch.optim.lr_scheduler.CosineAnnealingLR(opt1, T_max=epochs_3tuple[0])
+    mix1 = build_mixup(mixup_alphas[0])
+
+    for ep in range(epochs_3tuple[0]):
+        print(f"\n[Stage1] Epoch {ep+1}/{sum(epochs_3tuple)}")
+        tr_loss, ema_state = train_one_epoch(model, loaders['train'], opt1, mix1, criterion, ema_state)
+        va_loss, va_acc, va_bacc, va_f1 = validate_one_epoch(model, loaders['val'], criterion, ema_state)
+        sch1.step()
+        metric = va_bacc if save_metric=="bacc" else va_acc
+        print(f"TrainLoss {tr_loss:.4f} | ValLoss {va_loss:.4f} | Acc {va_acc:.4f} | BACC {va_bacc:.4f} | F1 {va_f1:.4f}")
+        if metric > best_val:
+            best_val = metric
+            torch.save({"model":model.state_dict(),"ema":ema_state,
+                        "val_bacc":float(va_bacc),"val_acc":float(va_acc),"val_f1":float(va_f1)}, ckpt_path)
+            print(f"💾 New BEST ({save_metric.upper()}={metric:.4f}) -> {ckpt_path}")
+
+    # Stage2: unfreeze all
+    for p in model.parameters(): p.requires_grad = True
+    opt2 = torch.optim.AdamW([
+        {"params": model.backbone.parameters(), "lr": lrs["back2"]},
+        {"params": list(model.meta.parameters()) + list(model.classifier.parameters()), "lr": lrs["head2"]}
+    ], weight_decay=WEIGHT_DECAY)
+    sch2 = torch.optim.lr_scheduler.CosineAnnealingLR(opt2, T_max=epochs_3tuple[1])
+    mix2 = build_mixup(mixup_alphas[1])
+
+    for ep in range(epochs_3tuple[1]):
+        print(f"\n[Stage2] Epoch {epochs_3tuple[0]+ep+1}/{sum(epochs_3tuple)}")
+        tr_loss, ema_state = train_one_epoch(model, loaders['train'], opt2, mix2, criterion, ema_state)
+        va_loss, va_acc, va_bacc, va_f1 = validate_one_epoch(model, loaders['val'], criterion, ema_state)
+        sch2.step()
+        metric = va_bacc if save_metric=="bacc" else va_acc
+        print(f"TrainLoss {tr_loss:.4f} | ValLoss {va_loss:.4f} | Acc {va_acc:.4f} | BACC {va_bacc:.4f} | F1 {va_f1:.4f}")
+        if metric > best_val:
+            best_val = metric
+            torch.save({"model":model.state_dict(),"ema":ema_state,
+                        "val_bacc":float(va_bacc),"val_acc":float(va_acc),"val_f1":float(va_f1)}, ckpt_path)
+            print(f"💾 New BEST ({save_metric.upper()}={metric:.4f}) -> {ckpt_path}")
+
+    # Stage3: small LR; mild/no mixup
+    opt3 = torch.optim.AdamW([
+        {"params": model.backbone.parameters(), "lr": lrs["back3"]},
+        {"params": list(model.meta.parameters()) + list(model.classifier.parameters()), "lr": lrs["head3"]}
+    ], weight_decay=WEIGHT_DECAY)
+    sch3 = torch.optim.lr_scheduler.CosineAnnealingLR(opt3, T_max=epochs_3tuple[2])
+    mix3 = build_mixup(mixup_alphas[2])
+
+    for ep in range(epochs_3tuple[2]):
+        print(f"\n[Stage3] Epoch {sum(epochs_3tuple[:2])+ep+1}/{sum(epochs_3tuple)}")
+        tr_loss, ema_state = train_one_epoch(model, loaders['train'], opt3, mix3, criterion, ema_state)
+        va_loss, va_acc, va_bacc, va_f1 = validate_one_epoch(model, loaders['val'], criterion, ema_state)
+        sch3.step()
+        metric = va_bacc if save_metric=="bacc" else va_acc
+        print(f"TrainLoss {tr_loss:.4f} | ValLoss {va_loss:.4f} | Acc {va_acc:.4f} | BACC {va_bacc:.4f} | F1 {va_f1:.4f}")
+        if metric > best_val:
+            best_val = metric
+            torch.save({"model":model.state_dict(),"ema":ema_state,
+                        "val_bacc":float(va_bacc),"val_acc":float(va_acc),"val_f1":float(va_f1)}, ckpt_path)
+            print(f"💾 New BEST ({save_metric.upper()}={metric:.4f}) -> {ckpt_path}")
+
+# ------------------ EVAL (TTA + PLOTS) ----------------------
+@torch.no_grad()
+def tta_predict(model, loader, ema_state, tta_modes=TTA_MODES):
+    model.eval()
+    probs_all, labels_all = [], []
+    with use_ema_weights(model, ema_state):
+        for (imgs, metas), labels in tqdm(loader, desc="TTA"):
+            imgs, metas, labels = imgs.to(device), metas.to(device), labels.to(device)
+            acc_probs = None
+            for m in tta_modes:
+                if   m=="orig":   it = imgs
+                elif m=="hflip":  it = torch.flip(imgs, dims=[3])
+                elif m=="rot90":  it = imgs.transpose(2,3).flip(2)
+                elif m=="rot180": it = torch.flip(imgs, dims=[2,3])
+                elif m=="rot270": it = imgs.transpose(2,3).flip(3)
+                else: it = imgs
+                logits = model(it, metas)
+                probs  = F.softmax(logits, dim=1)
+                acc_probs = probs if acc_probs is None else (acc_probs + probs)
+            acc_probs = acc_probs / float(len(tta_modes))
+            probs_all.append(acc_probs.cpu().numpy())
+            labels_all.append(labels.cpu().numpy())
+    return np.concatenate(probs_all), np.concatenate(labels_all)
+
+def evaluate_and_plot(probs, targets, tag=""):
+    preds = np.argmax(probs, axis=1)
+    acc  = accuracy_score(targets, preds)
+    bacc = recall_score(targets, preds, average='macro')
+    f1   = f1_score(targets, preds, average='macro')
+
+    print(f"\n✅ {tag} Results:\n  Accuracy: {acc:.4f}\n  Balanced Acc: {bacc:.4f}\n  Macro F1: {f1:.4f}")
+    print("\n📄 Classification Report:")
+    print(classification_report(targets, preds, target_names=class_labels_abbr, digits=4))
+
+    cm = confusion_matrix(targets, preds)
+    plt.figure(figsize=(8,6))
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
+                xticklabels=class_labels_abbr, yticklabels=class_labels_abbr)
+    plt.title(f"Confusion Matrix {tag}")
+    plt.xlabel("Predicted"); plt.ylabel("True")
+    plt.tight_layout(); plt.savefig(f"cm_{tag}.png", dpi=300); plt.close()
+
+    onehot = label_binarize(targets, classes=np.arange(num_classes))
+    plt.figure(figsize=(10,8))
+    for i in range(num_classes):
+        try:
+            fpr, tpr, _ = roc_curve(onehot[:, i], probs[:, i])
+            auc = roc_auc_score(onehot[:, i], probs[:, i])
+            plt.plot(fpr, tpr, label=f"{class_labels_abbr[i]} (AUC={auc:.2f})")
+        except ValueError:
+            pass
+    plt.plot([0,1],[0,1],'k--'); plt.title(f"ROC {tag}")
+    plt.xlabel("FPR"); plt.ylabel("TPR")
+    plt.legend(loc="lower right"); plt.grid(True)
+    plt.tight_layout(); plt.savefig(f"roc_{tag}.png", dpi=300); plt.close()
+
+    plt.figure(figsize=(10,8))
+    aps = []
+    for i in range(num_classes):
+        try:
+            pr, rc, _ = precision_recall_curve(onehot[:, i], probs[:, i])
+            ap = average_precision_score(onehot[:, i], probs[:, i])
+            aps.append(ap); plt.plot(rc, pr, label=f"{class_labels_abbr[i]} (AP={ap:.2f})")
+        except ValueError:
+            aps.append(np.nan)
+    plt.title(f"PR {tag}"); plt.xlabel("Recall"); plt.ylabel("Precision")
+    plt.legend(loc="lower left"); plt.grid(True)
+    plt.tight_layout(); plt.savefig(f"pr_{tag}.png", dpi=300); plt.close()
+
+    with open(f"metrics_{tag}.json","w") as f:
+        json.dump({"acc": float(acc), "bacc": float(bacc), "f1": float(f1),
+                   "per_class_AP": {cls: (None if np.isnan(aps[i]) else float(aps[i]))
+                                    for i, cls in enumerate(class_labels_abbr)}}, f, indent=2)
+    print(f"🖼️ Saved: cm_{tag}.png, roc_{tag}.png, pr_{tag}.png | 📝 metrics_{tag}.json")
+
+# ---------------- ENSEMBLE (ACC-LOCKED) ---------------------
+@torch.no_grad()
+def find_best_ensemble_weight_acc(model_a_name, ckpt_a, model_b_name, ckpt_b, val_loader):
+    """Optimize ensemble weight w in [0.6..1.0] to maximize ACC on validation."""
+    ma = BackboneMeta(model_a_name, num_classes, len(metadata_features), dropout=DROPOUT).to(device)
+    mb = BackboneMeta(model_b_name, num_classes, len(metadata_features), dropout=DROPOUT).to(device)
+    ca = load_ckpt_safe(ckpt_a, device); ma.load_state_dict(ca["model"]); ema_a = ca.get("ema", None)
+    cb = load_ckpt_safe(ckpt_b, device); mb.load_state_dict(cb["model"]); ema_b = cb.get("ema", None)
+
+    pa, y = tta_predict(ma, val_loader, ema_a, tta_modes=("orig","hflip","rot180"))
+    pb, _ = tta_predict(mb, val_loader, ema_b, tta_modes=("orig","hflip","rot180"))
+    w_best, acc_best = 1.0, -1.0
+    for w in np.linspace(0.6, 1.0, 9):
+        p = w*pa + (1-w)*pb
+        acc = accuracy_score(y, np.argmax(p, axis=1))
+        if acc > acc_best:
+            acc_best, w_best = float(acc), float(w)
+    print(f"[ACC-opt] best w={w_best:.2f} on val (ACC={acc_best:.4f})")
+    json.dump({"w_acc_opt": w_best, "acc_val": acc_best}, open("acc_lock.json","w"))
+    return w_best
+
+@torch.no_grad()
+def eval_ensemble_acc_locked(model_a_name, ckpt_a, model_b_name, ckpt_b, test_loader, w):
+    """Evaluate on test with ACC-locked ensemble weight."""
+    ma = BackboneMeta(model_a_name, num_classes, len(metadata_features), dropout=DROPOUT).to(device)
+    mb = BackboneMeta(model_b_name, num_classes, len(metadata_features), dropout=DROPOUT).to(device)
+    ca = load_ckpt_safe(ckpt_a, device); ma.load_state_dict(ca["model"]); ema_a = ca.get("ema", None)
+    cb = load_ckpt_safe(ckpt_b, device); mb.load_state_dict(cb["model"]); ema_b = cb.get("ema", None)
+
+    pa, y = tta_predict(ma, test_loader, ema_a, tta_modes=TTA_MODES)
+    pb, _ = tta_predict(mb, test_loader, ema_b, tta_modes=TTA_MODES)
+    probs = w*pa + (1-w)*pb
+    evaluate_and_plot(probs, y, tag=f"ENSEMBLE_ACC_LOCK_w{w:.2f}")
+
+# -------- THRESHOLDING (MEL CONSTRAINT, OPTIONAL) ----------
+def predict_with_thresholds(probs: np.ndarray, thr: np.ndarray) -> np.ndarray:
+    """Apply per-class thresholds; fallback to argmax if no class passes."""
+    preds = np.argmax(probs, axis=1)
+    for i in range(probs.shape[0]):
+        hits = np.where(probs[i] >= thr)[0]
+        if hits.size:
+            preds[i] = hits[np.argmax(probs[i, hits])]
+    return preds
+
+def acc_bacc_with_thresholds(y_true: np.ndarray, probs: np.ndarray, thr: np.ndarray):
+    preds = predict_with_thresholds(probs, thr)
+    acc  = accuracy_score(y_true, preds)
+    bacc = recall_score(y_true, preds, average='macro')
+    return float(acc), float(bacc)
+
+@torch.no_grad()
+def ensemble_probs_with_weight(model_a_name, ckpt_a, model_b_name, ckpt_b,
+                               loader, w, tta_modes=("orig","hflip","rot180")):
+    ma = BackboneMeta(model_a_name, num_classes, len(metadata_features), dropout=DROPOUT).to(device)
+    mb = BackboneMeta(model_b_name, num_classes, len(metadata_features), dropout=DROPOUT).to(device)
+    ca = load_ckpt_safe(ckpt_a, device); ma.load_state_dict(ca["model"]); ema_a = ca.get("ema", None)
+    cb = load_ckpt_safe(ckpt_b, device); mb.load_state_dict(cb["model"]); ema_b = cb.get("ema", None)
+
+    pa, y = tta_predict(ma, loader, ema_a, tta_modes=tta_modes)
+    pb, _ = tta_predict(mb, loader, ema_b, tta_modes=tta_modes)
+    return w*pa + (1-w)*pb, y
+
+def tune_mel_threshold_with_acc_constraint(probs_val: np.ndarray,
+                                           y_val: np.ndarray,
+                                           mel_class_idx: int,
+                                           base_thr: float = 0.50,
+                                           mel_min_recall: float = 0.90,
+                                           grid=np.linspace(0.30, 0.70, 21)):
+    """Maximize overall ACC with constraint Recall_MEL >= mel_min_recall."""
+    C = probs_val.shape[1]
+    thr_best = np.full(C, base_thr, dtype=np.float32)
+    best_acc, best_rec_mel = -1.0, 0.0
+    for t in grid:
+        thr_try = np.full(C, base_thr, dtype=np.float32); thr_try[mel_class_idx] = float(t)
+        preds = predict_with_thresholds(probs_val, thr_try)
+        acc   = accuracy_score(y_val, preds)
+        rec_mel = recall_score(y_val == mel_class_idx, preds == mel_class_idx)
+        if (rec_mel >= mel_min_recall) and (acc > best_acc):
+            best_acc, best_rec_mel = float(acc), float(rec_mel); thr_best = thr_try
+    return thr_best, best_acc, best_rec_mel
+
+@torch.no_grad()
+def eval_ensemble_on_test_with_thresholds(model_a_name, ckpt_a, model_b_name, ckpt_b,
+                                          test_loader, w, thr, tag="ENSEMBLE_ACC_LOCK_MELTHR"):
+    probs, y = ensemble_probs_with_weight(model_a_name, ckpt_a, model_b_name, ckpt_b,
+                                          test_loader, w, tta_modes=TTA_MODES)
+    acc_thr, bacc_thr = acc_bacc_with_thresholds(y, probs, thr)
+    print(f"\n✅ {tag} (threshold-aware) on TEST: ACC={acc_thr:.4f} | BACC={bacc_thr:.4f}")
+    with open(f"thresholds_{tag}.json","w") as f:
+        json.dump({"per_class_thresholds": list(map(float, thr))}, f, indent=2)
+    print(f"📝 Saved: thresholds_{tag}.json")
+    evaluate_and_plot(probs, y, tag=tag)
+
+# ----------------------------- MAIN -------------------------
+def main():
+    # ===== ACC model (save best by ACC) =====
+    model_acc = BackboneMeta(ACC_BACKBONE, num_classes, len(metadata_features), dropout=DROPOUT).to(device)
+    loaders_acc = {"train": train_loader_acc, "val": val_loader_acc}
+    run_stages(model_acc, loaders_acc, EPOCHS_ACC, LRS_ACC, LOSS_CFG_ACC,
+               WEIGHTS_ACC, CKPT_ACC, MIXUP_ACC, save_metric="acc")
+
+    # Free VRAM
+    del model_acc; torch.cuda.empty_cache()
+
+    # ===== BAL model (save best by BACC) =====
+    model_bal = BackboneMeta(BAL_BACKBONE, num_classes, len(metadata_features), dropout=DROPOUT).to(device)
+    loaders_bal = {"train": train_loader_bal, "val": val_loader_bal}
+    run_stages(model_bal, loaders_bal, EPOCHS_BAL, LRS_BAL, LOSS_CFG_BAL,
+               WEIGHTS_BAL, CKPT_BAL, MIXUP_BAL, save_metric="bacc")
+
+    # Free VRAM
+    del model_bal; torch.cuda.empty_cache()
+
+    # ===== Single-model evals (TTA+EMA) =====
+    for tag, bname, ckpt, test_loader in [
+        ("ACC", ACC_BACKBONE, CKPT_ACC, test_loader_acc),
+        ("BAL", BAL_BACKBONE, CKPT_BAL, test_loader_bal)
+    ]:
+        m = BackboneMeta(bname, num_classes, len(metadata_features), dropout=DROPOUT).to(device)
+        ema = None
+        if os.path.exists(ckpt):
+            c = load_ckpt_safe(ckpt, device)
+            m.load_state_dict(c["model"]); ema = c.get("ema", None)
+            print(f"[info] Loaded {tag} ckpt: ACC={c.get('val_acc',None)} | BACC={c.get('val_bacc',None)}")
+        probs, targets = tta_predict(m, test_loader, ema, tta_modes=TTA_MODES)
+        evaluate_and_plot(probs, targets, tag=tag)
+        del m; torch.cuda.empty_cache()
+
+    # ===== Ensemble (ACC-locked) =====
+    w_acc = find_best_ensemble_weight_acc(ACC_BACKBONE, CKPT_ACC, BAL_BACKBONE, CKPT_BAL, val_loader_acc)
+    eval_ensemble_acc_locked(ACC_BACKBONE, CKPT_ACC, BAL_BACKBONE, CKPT_BAL, test_loader_acc, w_acc)
+
+    # ===== MEL-threshold tuning (optional) =====
+    MEL_IDX = disease_dict['mel']; MEL_MIN_RECALL = 0.90; BASE_THR = 0.50
+    probs_val_ens, y_val = ensemble_probs_with_weight(
+        ACC_BACKBONE, CKPT_ACC, BAL_BACKBONE, CKPT_BAL, val_loader_acc, w_acc,
+        tta_modes=("orig","hflip","rot180")
+    )
+    thr_opt, acc_val_thr, rec_mel_val = tune_mel_threshold_with_acc_constraint(
+        probs_val_ens, y_val, mel_class_idx=MEL_IDX,
+        base_thr=BASE_THR, mel_min_recall=MEL_MIN_RECALL
+    )
+    print(f"[val] MEL-threshold tuned: ACC={acc_val_thr:.4f} | Recall_MEL={rec_mel_val:.4f}")
+    print(f"[val] thresholds = {np.round(thr_opt,3)}")
+
+    eval_ensemble_on_test_with_thresholds(
+        ACC_BACKBONE, CKPT_ACC, BAL_BACKBONE, CKPT_BAL,
+        test_loader_acc, w_acc, thr_opt, tag=f"ENSEMBLE_ACC_LOCK_MELTHR_R{MEL_MIN_RECALL:.2f}"
+    )
+
+if __name__ == "__main__":
+    main()
